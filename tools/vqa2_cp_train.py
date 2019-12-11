@@ -50,10 +50,10 @@ def main(params):
         max_nb_epochs=params.epochs,
         distributed_backend=params.dist_backend,
         use_amp=params.use_16bit,
-        nb_sanity_val_steps=0,
+        # nb_sanity_val_steps=0,
         # val_check_interval=0.01,
-        val_percent_check=0.01,
-        train_percent_check=0.002,
+        # val_percent_check=0.01,
+        # train_percent_check=0.002,
         early_stop_callback=False,
     )
     if params.evaluate:

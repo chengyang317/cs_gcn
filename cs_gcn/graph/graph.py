@@ -2,7 +2,7 @@
 import torch
 from .node import Node
 from .edge import Edge
-import numpy as np
+import torch_scatter as ts
 
 
 __all__ = ['Graph']
@@ -12,12 +12,11 @@ class Graph(object):
     def __init__(self,
                  node_feats,
                  node_boxes=None,
-                 node_weights=None,
                  node_masks=None,
                  init_method: str = 'full',
                  cond_feats=None,
                  ):
-        self.node = Node(self, node_feats, node_boxes, node_weights, node_masks)
+        self.node = Node(self, node_feats, node_boxes, node_masks)
         self.edge = Edge(self.node, init_method)
         self.cond_feats = cond_feats
         self.feats = list()
@@ -39,24 +38,12 @@ class Graph(object):
         return self.edge.edge_num
 
     @property
-    def node_feats(self):
-        return self.node.feats
-
-    @property
-    def edge_feats(self):
-        return self.edge.feats
-
-    @property
     def edge_attrs(self):
         return self.edge.edge_attrs
 
     @property
     def node_weights(self):
         return self.node.weights
-
-    @property
-    def edge_weights(self):
-        return self.edge.weights
 
     def clear(self):
         self.edge.clear_ops()
@@ -66,20 +53,34 @@ class Graph(object):
             method = method.split('^')[-1]
             node_feats = self.node_feats * self.node_weights
         else:
-            node_feats = self.node_feats
+            node_feats = self.node.feats
 
         if method == 'mean':
-            return node_feats.mean(dim=1).squeeze()
+            feats = ts.scatter_mean(node_feats, self.node.batch_ids, dim=0)
         elif method == 'max':
-            return node_feats.max(dim=1)[0]
+            feats = ts.scatter_max(node_feats, self.node.batch_ids, dim=0)[0]
         elif method == 'sum':
-            return node_feats.sum(dim=1)
+            feats = ts.scatter_sum(node_feats, self.node.batch_ids, dim=0)
         elif method == 'mix':
-            max_feat = node_feats.max(dim=1)[0]
-            mean_feat = node_feats.mean(dim=1).squeeze(1)
-            return torch.cat((max_feat, mean_feat), dim=-1)
+            max_feat = ts.scatter_max(node_feats, self.node.batch_ids, dim=0)[0]
+            mean_feat = ts.scatter_mean(node_feats, self.node.batch_ids, dim=0)
+            feats = torch.cat((max_feat, mean_feat), dim=-1)
         else:
             raise NotImplementedError()
+        return feats
+
+        # if method == 'mean':
+        #     return node_feats.mean(dim=1).squeeze()
+        # elif method == 'max':
+        #     return node_feats.max(dim=1)[0]
+        # elif method == 'sum':
+        #     return node_feats.sum(dim=1)
+        # elif method == 'mix':
+        #     max_feat = node_feats.max(dim=1)[0]
+        #     mean_feat = node_feats.mean(dim=1).squeeze(1)
+        #     return torch.cat((max_feat, mean_feat), dim=-1)
+        # else:
+        #     raise NotImplementedError()
 
 
 

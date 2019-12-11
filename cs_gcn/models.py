@@ -14,28 +14,29 @@ class CGCNModel(pl.LightningModule):
     def __init__(self, params):
         super().__init__()
         self.hparams = params
-        vocab_num, answer_num = self.train_dataloader().vocab_num, self.train_dataloader().answer_num
+        vocab_num, answer_num = self.vocab_num, self.answer_num
         self.hparams.vocab_num, self.hparams.answer_num = vocab_num, answer_num
         self.q_layer = CgsQLayer(vocab_num, hid_dim=params.q_hid_dim, dropout=params.q_drop, padding_idx=params.padding_idx)
 
         self.g_stem_l = GraphStemLayer(params.n_dim, params.q_hid_dim, params.n_hid_dim, params.n_stem_method, params.n_drop)
 
         g_conv_layers = []
-        for step in range(params.iter_nums):
+        for step in range(params.iter_num):
             g_conv_layers.append(
                 GraphConvLayer(params.n_hid_dim, params.q_hid_dim, params.e_dim, params.n_hid_dim, params.e_feat_method,
                                params.e_weight_method, params.e_param_method, params.n_feat_method, params.n_drop)
             )
         self.g_conv_layers = nn.ModuleList(g_conv_layers)
 
-        v_dim = (params.n_hid_dim * 2 if params.pool_method == 'mix' else params.n_hid_dim) * params.iter_nums
+        v_dim = (params.n_hid_dim * 2 if params.pool_method == 'mix' else params.n_hid_dim) * params.iter_num
         self.g_cls_l = GraphClsLayer(v_dim, params.q_hid_dim, answer_num, params.cls_method, params.n_drop)
 
         if params.dataset == 'vqa2_cp':
             self.criterion = pt.Vqa2CrossEntropy()
-        elif params.dataset in ('gqa_lcgn',):
+        elif params.dataset in ('gqa_lcgn', 'gqa_graph'):
             self.criterion = GqaCrossEntropy()
-
+        else:
+            NotImplementedError()
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -48,17 +49,22 @@ class CGCNModel(pl.LightningModule):
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 func(m.weight)
         if self.hparams.dataset == 'vqa2_cp':
-            self.q_layer.embedding.weight.data.copy_(self.q_vocab.glove_embed('glove.6B.300d'))
+            q_vocab = self.train_dataloader().dataset.question_vocab
+            self.q_layer.embedding.weight.data.copy_(q_vocab.glove_embed('glove.6B.300d'))
         elif self.hparams.dataset == 'gqa_lcgn':
             import numpy as np
             embed_file = self.hparams.data_dir + '/gloves_gqa_no_pad.npy'
             self.q_layer.embedding.weight.data[1:].copy_(torch.Tensor(np.load(embed_file)))
+        elif self.hparams.dataset == 'gqa_graph':
+            q_vocab = self.train_dataloader().dataset.question_vocab
+            self.q_layer.embedding.weight.data[1:].copy_(torch.Tensor(q_vocab.embed_init))
         else:
             raise NotImplementedError()
 
     def forward(self, obj_feats, obj_boxes, q_labels, q_nums, obj_masks=None):
         q_feats = self.q_layer(q_labels, q_nums)
-        graph = Graph(obj_feats, obj_boxes, node_masks=obj_masks, init_method=self.hparams.g_init_method, cond_feats=q_feats)
+
+        graph = Graph(obj_feats, obj_boxes, obj_masks, self.hparams.g_init_method, cond_feats=q_feats)
 
         graph = self.g_stem_l(graph)
 
@@ -69,38 +75,64 @@ class CGCNModel(pl.LightningModule):
             pool_feats.append(graph.pool_feats(self.hparams.pool_method))
         v_feats = torch.cat(pool_feats, dim=-1)
         logits = self.g_cls_l(v_feats, graph.cond_feats)
+        del graph
         return logits
 
+    def get_inputs(self, data_batch):
+        if self.hparams.dataset == 'gqa_lcgn':
+            return {key: data_batch.get(key, None) for key in ('obj_feats', 'obj_boxes', 'q_labels', 'q_nums', 'obj_masks')}
+        elif self.hparams.dataset == 'vqa2_cp':
+            obj_feats, obj_boxes = data_batch['img_obj_feats'].split((2048, 4), dim=-1)
+            return {'obj_feats': obj_feats, 'obj_boxes': obj_boxes, 'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens']}
+        elif self.hparams.dataset == 'gqa_graph':
+            return {'obj_feats': data_batch['img_obj_feats'], 'obj_boxes': data_batch['img_obj_boxes'],
+                    'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens'], 'obj_masks': data_batch['img_obj_masks']
+                    }
+        else:
+            raise NotImplementedError()
+
     def training_step(self, data_batch, batch_nb):
-        inputs = {key: data_batch.get(key, None) for key in ('obj_feats', 'obj_boxes', 'q_labels', 'q_nums', 'obj_masks')}
-        logits = self.forward(**inputs)
-        loss, acc = self.criterion(logits, data_batch['a_labels'])
+        logits = self.forward(**self.get_inputs(data_batch))
+        if self.hparams.dataset in ('gqa_lcgn', 'gqa_graph'):
+            loss, acc = self.criterion(logits, data_batch['a_labels'])
+        elif self.hparams.dataset == 'vqa2_cp':
+            loss, acc = self.criterion(logits, data_batch['a_label_scores'], data_batch['a_label_counts'])
+        output = {'loss': loss, 'acc': acc}
+        return output
+
+    def training_end(self, outputs):
+        loss = outputs['loss'].mean()
+        acc = outputs['acc'].mean()
         output = {'loss': loss, 'progress_bar': {'train_acc': acc},
                   'log': {'train_loss': loss, 'train_acc': acc}
                   }
         return output
 
     def validation_step(self, data_batch, batch_nb):
-        inputs = {key: data_batch.get(key, None) for key in ('obj_feats', 'obj_boxes', 'q_labels', 'q_nums', 'obj_masks')}
-        logits = self.forward(**inputs)
-        loss, acc = self.criterion(logits, data_batch['a_labels'])
-        return {'val_loss': loss, 'val_acc': torch.tensor(acc)}
+        logits = self.forward(**self.get_inputs(data_batch))
+        if self.hparams.dataset in ('gqa_lcgn', 'gqa_graph'):
+            loss, acc = self.criterion(logits, data_batch['a_labels'])
+        elif self.hparams.dataset == 'vqa2_cp':
+            loss, acc = self.criterion(logits, data_batch['a_label_scores'], data_batch['a_label_counts'])
+        return {'val_loss': loss, 'val_acc': acc}
 
     def validation_end(self, outputs):
         val_loss_mean = 0
         val_acc_mean = 0
         for output in outputs:
-            val_loss_mean += output['val_loss']
-            val_acc_mean += output['val_acc']
+            val_loss_mean += output['val_loss'].mean()
+            val_acc_mean += output['val_acc'].mean()
 
         val_loss_mean /= len(outputs)
         val_acc_mean /= len(outputs)
-        tqdm_dict = {'val_loss': val_loss_mean.item(), 'val_acc': val_acc_mean.item()}
+        tqdm_dict = {'val_loss': val_loss_mean, 'val_acc': val_acc_mean}
 
         # show val_loss and val_acc in progress bar but only log val_loss
         results = {
             'progress_bar': tqdm_dict,
-            'log': {'val_loss': val_loss_mean.item(), 'val_acc': val_acc_mean.item()}
+            'log': tqdm_dict,
+            'val_loss': tqdm_dict['val_loss'],
+            'val_acc': tqdm_dict['val_acc']
         }
         return results
 
@@ -111,12 +143,17 @@ class CGCNModel(pl.LightningModule):
     @pl.data_loader
     def train_dataloader(self):
         if self.hparams.dataset == 'vqa2_cp':
-            dataset = pt.GraphVqa2CpDataset(add_field_name=False)
+            dataset = pt.GraphVqa2CpDataset()
             loader = DataLoader(dataset, self.hparams.batch_size, True, num_workers=self.hparams.num_workers,
                                 collate_fn=dataset.collate_fn)
         elif self.hparams.dataset == 'gqa_lcgn':
             from datasets.lcgn import load_train_data
             loader = load_train_data(self.hparams)
+        elif self.hparams.dataset == 'gqa_graph':
+            gpu_num = len(self.hparams.gpus.split(','))
+            dataset = pt.GraphGqaDataset(gpu_num=gpu_num)
+            loader = DataLoader(dataset, self.hparams.batch_size, True, num_workers=self.hparams.num_workers,
+                                collate_fn=dataset.collate_fn)
         else:
             raise NotImplementedError()
 
@@ -125,16 +162,39 @@ class CGCNModel(pl.LightningModule):
     @pl.data_loader
     def val_dataloader(self):
         if self.hparams.dataset == 'vqa2_cp':
-            dataset = pt.GraphVqa2CpDataset(split='test', add_field_name=False)
+            dataset = pt.GraphVqa2CpDataset(split='test',)
             loader = DataLoader(dataset, self.hparams.batch_size, False, num_workers=self.hparams.num_workers,
                                 collate_fn=dataset.collate_fn)
         elif self.hparams.dataset == 'gqa_lcgn':
             from datasets.lcgn import load_eval_data
             loader = load_eval_data(self.hparams)
+        elif self.hparams.dataset == 'gqa_graph':
+            gpu_num = len(self.hparams.gpus.split(','))
+            dataset = pt.GraphGqaDataset(split='val', gpu_num=gpu_num)
+            loader = DataLoader(dataset, self.hparams.batch_size, False, num_workers=self.hparams.num_workers,
+                                collate_fn=dataset.collate_fn)
         else:
             raise NotImplementedError()
 
         return loader
+
+    @property
+    def vocab_num(self):
+        if self.hparams.dataset == 'gqa_lcgn':
+            return self.train_dataloader().vocab_num
+        elif self.hparams.dataset in ('vqa2_cp', 'gqa_graph'):
+            return len(self.train_dataloader().dataset.question_vocab)
+        else:
+            raise NotImplementedError()
+
+    @property
+    def answer_num(self):
+        if self.hparams.dataset == 'gqa_lcgn':
+            return self.train_dataloader().answer_num
+        elif self.hparams.dataset in ('vqa2_cp', 'gqa_graph'):
+            return len(self.train_dataloader().dataset.answer_vocab)
+        else:
+            raise NotImplementedError()
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -156,14 +216,14 @@ class CGCNModel(pl.LightningModule):
 
         parser.add_argument('--g_init_method', default='full', type=str)
 
-        parser.opt_list('--iter_nums', default=3, options=[1, 2, 3, 4, 5], type=int)
+        parser.opt_list('--iter_num', default=2, options=[1, 2, 3, 4, 5], type=int)
 
         parser.opt_list('--cls_method', default='linear', options=['linear'], type=str)
         parser.opt_list('--pool_method', default='mix', options=['mix', 'mean', 'max'], type=str)
 
         parser.opt_list('--dataset', default='vqa2_cp', type=str, options=['vaq2_cp', 'gqa_lcgn'])
         parser.add_argument('--epochs', default=20, type=int)
-        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('--batch_size', default=55, type=int)
         parser.add_argument('--num_workers', default=0, type=int)
-        parser.add_argument('--lr', default=3e-4, type=float)
+        parser.add_argument('--lr', default=2e-4, type=float)
         return parser

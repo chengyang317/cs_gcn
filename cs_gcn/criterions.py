@@ -10,6 +10,6 @@ class GqaCrossEntropy(nn.Module):
     def forward(self, logits, a_labels):
         loss = self.loss_l(logits, a_labels)
         correct = logits.max(1)[1] == a_labels
-        acc = correct.sum().item() / logits.size(0)
+        acc = correct.sum().float() / logits.size(0)
         return loss, acc
 

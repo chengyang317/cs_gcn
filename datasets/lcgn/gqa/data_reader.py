@@ -81,6 +81,7 @@ class GqaBatchLoader(object):
 
     def load_one_batch(self, sample_ids):
         batch = {}
+        node_nums = list()
         actual_b_num = len(sample_ids)
         input_seq_batch = torch.zeros(actual_b_num, self.text_length, dtype=torch.int64)
         seq_length_batch = torch.zeros(actual_b_num, dtype=torch.int64)
@@ -126,6 +127,7 @@ class GqaBatchLoader(object):
                 objects_feat_batch[n:n+1] = torch.from_numpy(feature)
                 objects_bbox_batch[n:n+1] = torch.from_numpy(normalized_bbox)
                 objects_valid_batch[n:n+1] = torch.from_numpy(valid)
+                node_nums.append(valid.sum())
             if self.load_scene_graph_feature:
                 feature, normalized_bbox, valid = \
                     self.scene_graph_loader.load_feature_normalized_bbox(
@@ -165,7 +167,10 @@ class GqaBatchLoader(object):
                     (objects_feat_batch, objects_bbox_tile), axis=-1)
             else:
                 image_feat_batch = objects_feat_batch
+        max_node_num = max(node_nums)
         batch = {key: value for key, value in batch.items() if key in self.req_field_names}
+        for key in ('obj_feats', 'obj_boxes', 'obj_masks'):
+            batch[key] = batch[key][:, :max_node_num]
         return batch
 
     def __len__(self):
@@ -179,6 +184,8 @@ class GqaLoader(object):
         self.req_field_names = getattr(params, 'req_field_names',
                                        ('q_labels', 'q_nums', 'obj_feats', 'obj_boxes', 'obj_masks', 'q_ids', 'a_labels')
                                        )
+        if getattr(params, 'data_dir', None) is None:
+            params.data_dir = 'work_dir/data/gqa_lcgn'
         self.work_dir = pt.to_path(params.data_dir)
         text_length = getattr(params, 'text_length', 30)
         params.text_length = text_length

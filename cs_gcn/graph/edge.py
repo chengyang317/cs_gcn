@@ -26,7 +26,7 @@ class EdgeOp(object):
         self.next_ops = {}
         self.node_i_ids, self.node_j_ids = None, None
         self.mask = None
-        self.select_ids = None
+        # self.select_ids = None
         self.op_process()
 
     def op_process(self):
@@ -74,12 +74,9 @@ class EdgeOp(object):
     def edge_num(self):
         return len(self.node_i_ids)
 
-    @property
-    def select_batch_ids(self):
-        return self.select_ids // (self.node_num*self.node_num)
-
     def clear_ops(self):
         self.next_ops = {}
+        self.edge_attrs = {}
 
     def norm_attr(self, edge_attr, norm_method):
         edge_attr = edge_attr.view(-1, edge_attr.size(-1))
@@ -157,18 +154,26 @@ class EdgeOp(object):
             raise NotImplementedError()
         return joint_feats
 
+    def batch_ids(self):
+        return self.node.batch_ids[self.node_j_ids]
+
     def expand_cond_attr(self, cond_attr):
         """
 
         :param cond_attr: b,c
         :return:
         """
-        return cond_attr[self.select_batch_ids]
+        if self.mask is not None:
+            return cond_attr[self.batch_ids()]
+        else:
+            return cond_attr.view(self.batch_num, 1, 1, cond_attr.size(-1)).repeat(1, self.node_num, self.node_num, 1).view(-1, cond_attr.size(-1))
 
     def origin_reshape(self, edge_attr, fill_value=0.):
         if edge_attr.dim() == 1:
             edge_attr = edge_attr.view(-1, 1)
         c_dim = edge_attr.size(-1)
+        if self.mask is None:
+            return edge_attr.view(self.batch_num, self.node_num, -1, c_dim)
         new_attr = edge_attr.new_full((self.batch_num, self.node_num, self.node_num, c_dim), fill_value)
         # new_attr = new_attr.masked_fill(self.mask.unsqueeze(-1), edge_attr)
         new_attr[self.mask] = edge_attr
@@ -202,25 +207,29 @@ class EdgeInit(EdgeOp):
         super().__init__(f'init_{method}', EdgeNull(node))
 
     def op_process(self):
-        if self.node.masks is None:
-            edge_mask = self.init_mask
-        else:
-            edge_mask = node_intersect(self.node.masks.unsqueeze(-1), 'mul').squeeze(-1) * self.init_mask
-        node_i, node_j = self.meshgrid_cache  # b, n, n
-        node_i, node_j = node_i.cuda(self.device)[edge_mask], node_j.cuda(self.device)[edge_mask]  # k, k
-        self.node_i_ids, self.node_j_ids = self.node.node_map(node_i), self.node.node_map(node_j)
-        self.mask = edge_mask  # b, n, n
         if self.node.masks is None and self.method == 'full':
-            self.select_ids = None
+            self.mask = None
+        elif self.node.masks is None:
+            self.mask = self.init_mask()
         else:
-            self.select_ids = edge_mask.view(-1).nonzero().squeeze()  # k
+            self.mask = node_intersect(self.node.masks.unsqueeze(-1), 'mul').squeeze(-1) * self.init_mask()
+        node_i, node_j = self.meshgrid_cache  # b, n, n
+        if self.mask is not None:
+            node_i, node_j = node_i.cuda(self.device)[self.mask], node_j.cuda(self.device)[self.mask]  # k, k
+        else:
+            node_i, node_j = node_i.view(-1).cuda(self.device), node_j.view(-1).cuda(self.device)
+        self.node_i_ids, self.node_j_ids = self.node.map_idx(node_i), self.node.map_idx(node_j)
+
+        # if self.mask is None:
+        #     self.select_ids = torch.arange(len(self.node_i_ids), device=self.device)
+        # else:
+        #     self.select_ids = self.mask.view(-1).nonzero().squeeze()  # k
 
     def _attr_process(self, attr: torch.Tensor):
         attr = attr.view(-1, attr.shape[-1])
         assert attr.shape[0] == self.node_num * self.node_num * self.batch_num
-        return attr[self.indexes]
+        return attr[self.select_ids]
 
-    @property
     def init_mask(self):
         if self.method == 'full':
             return self.full_mask_cache.cuda(self.device)
@@ -249,14 +258,15 @@ class EdgeTopK(EdgeOp):
     def op_process(self):
         by_attr, last_op = self.by_attr, self.last_op
         fake_by_attr = last_op.origin_reshape(by_attr, fill_value=-1e3)
-        self.by_attr, self.top_ids = self.attr_topk(fake_by_attr, -2, self.reduce_size, keep_self=self.keep_self)
+        self.top_ids = self.attr_topk(fake_by_attr, -2, self.reduce_size, keep_self=self.keep_self)
 
         l_select_ids = last_op.origin_reshape(torch.arange(last_op.edge_num).cuda(self.device), fill_value=-1)
         l_select_ids = l_select_ids.gather(index=self.top_ids, dim=-2).view(-1)
         self.l_select_ids = l_select_ids[l_select_ids != -1]
         self.node_i_ids, self.node_j_ids = self._attr_process(last_op.node_i_ids), self._attr_process(
             last_op.node_j_ids)
-        self.select_ids = self._attr_process(last_op.select_ids)
+        # self.select_ids = self._attr_process(last_op.select_ids)
+        self.by_attr = None
 
     def attr_topk(self, attr, dim, reduce_size=-1, keep_self=False):
         """
@@ -276,9 +286,9 @@ class EdgeTopK(EdgeOp):
             loop_mask = self.eye_mask_cache.cuda(self.device)
             fake_attr = attr.masked_fill(loop_mask.unsqueeze(-1), 1e4)
             _, top_ids = fake_attr.topk(reduce_size, dim=dim, sorted=False)
-            attr = attr.gather(index=top_ids, dim=-2)
+            # attr = attr.gather(index=top_ids, dim=-2)
 
-        return attr, top_ids
+        return top_ids
 
     def _attr_process(self, edge_attr: torch.Tensor):
         """
@@ -317,14 +327,17 @@ class Edge(EdgeInit):
         return self.next_ops[f'top_{reduce_size}']
 
     def geo_feats(self):
-        node_size, node_centre = self.node.size_center
-        node_dists = node_intersect(self.node.boxes, 'minus')  # b, n, n, 4
-        node_dists = node_dists / (torch.cat((node_size, node_size), dim=-1).unsqueeze(dim=2) + 1e-9)
-        node_scale = node_intersect(node_size, 'divide')
-        node_mul = node_intersect(node_size[:, :, 0].unsqueeze(-1)*node_size[:, :, 1].unsqueeze(-1), 'divide')
-        node_sum = node_intersect(node_size[:, :, 0].unsqueeze(-1)+node_size[:, :, 1].unsqueeze(-1), 'divide')
-        geo_feats = torch.cat((node_dists, node_scale, node_mul, node_sum), dim=-1)
-        return self.filter_edge_attr(geo_feats)
+        node_size, _ = self.node.size_center()
+        node_i_box, node_j_box = self.expand_node_attr(self.node.boxes)
+        node_i_size, node_j_size = self.expand_node_attr(node_size)
+
+        node_dist = node_i_box - node_j_box
+        node_dist = node_dist / (node_i_size.repeat(1, 2) + 1e-9)
+        node_scale = node_i_size / (node_j_size + 1e-9)
+        node_mul = (node_i_size[:, 0] * node_j_size[:, 1]) / (node_j_size[:, 0] * node_j_size[:, 1] + 1e-9)
+        node_sum = (node_i_size[:, 0] + node_j_size[:, 1]) / (node_j_size[:, 0] + node_j_size[:, 1] + 1e-9)
+        return torch.cat((node_dist, node_scale, node_mul[:, None], node_sum[:, None]), dim=-1)
+
 
 
 

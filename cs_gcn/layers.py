@@ -20,6 +20,7 @@ class CgsQLayer(nn.Module):
         if not isinstance(q_length, list):
             q_length = [q_length]
         packed = pack_padded_sequence(emb, q_length, batch_first=True, enforce_sorted=False)
+        self.rnn.flatten_parameters()
         _, hid = self.rnn(packed)
         hid = self.dropout_l(hid)
         return hid.squeeze(0)
@@ -83,17 +84,14 @@ class GraphConvLayer(nn.Module):
         graph = self.e_param_l(graph)
         graph = self.n_feat_l(graph)
 
-        b_num, n_num, c_num = graph.batch_num, graph.node_num, graph.node.feat_dim
+        # b_num, n_num, c_num = graph.batch_num, graph.node_num, graph.node.feat_num
         e_weights = graph.edge_attrs['weights'].value * graph.edge_attrs['params'].value
-        n_feats = graph.node.feats
         last_op = graph.edge_attrs['weights'].op
-        n_j_feats = n_feats.view(b_num*n_num, c_num)[last_op.node_j_ids]
+        n_j_feats = graph.node.feats[last_op.node_j_ids]
         nb_feats = e_weights * n_j_feats
         nb_feats = ts.scatter_add(nb_feats, last_op.node_i_ids, dim=0)
         nb_feats = self.act_l(nb_feats)
-        n_feats = nb_feats.new_zeros((b_num*n_num, c_num))
-        n_feats[:nb_feats.size(0)] = nb_feats
-        graph.node.update_feats(n_feats.view(b_num, n_num, c_num))
+        graph.node.update_feats(nb_feats)
         return graph
 
 

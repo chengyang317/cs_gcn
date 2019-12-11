@@ -23,9 +23,11 @@ class FilmFusion(nn.Module):
         self.film_l = pt.Linear(in_dim, out_dim, norm_type=norm_type, norm_affine=False, orders=('linear', 'norm', 'cond'))
         self.act_l = pt.Act(act_type)
 
-    def forward(self, x, cond):
+    def forward(self, x, cond, batch_ids=None):
         gamma, beta = self.cond_proj_l(cond).chunk(2, dim=-1)
         gamma += 1.
+        if batch_ids is not None:
+            beta, gamma = beta[batch_ids], gamma[batch_ids]
         x = self.drop_l(x)
         x = self.film_l(x, gamma, beta)
         x = self.act_l(x)
@@ -70,7 +72,7 @@ class EdgeFeat(nn.Module):
         elif self.method == 'share':
             e_feat_l = graph.edge.feat_layers[self.layer_key]
             return e_feat_l(graph)
-        b_num, n_num = graph.batch_num, graph.node_num
+        # b_num, n_num = graph.batch_num, graph.node_num
         node_feats = self.n_proj(graph.node.node_feats('cat', self.drop_l))
         n_join_feats = graph.edge.combine_node_attr(node_feats, self.n2n)
 
@@ -80,7 +82,7 @@ class EdgeFeat(nn.Module):
         join_feats = torch.cat((n_join_feats, e_geo_feats), dim=-1)
 
         if self.n2c == 'film':
-            e_feats = self.n2c_fusion(join_feats, graph.edge.expand_cond_attr(graph.cond_feats))
+            e_feats = self.n2c_fusion(join_feats, graph.cond_feats, graph.edge.batch_ids())
         else:
             raise NotImplementedError()
         graph.edge.edge_attrs['feats'] = EdgeAttr('feats', e_feats, graph.edge.init_op())
@@ -123,7 +125,7 @@ class EdgeWeight(nn.Module):
 
         e_feats = edge.edge_attrs['feats']
         e_scores = EdgeAttr('scores', score_l(e_feats.value), e_feats.op)
-        edge.edge_attrs['scores'] = e_scores
+        # edge.edge_attrs['scores'] = e_scores
         e_weights = e_scores.op.norm_attr(e_scores.value, self.norm_method)
         topk_op = edge.topk_op(e_weights, self.reduce_size, keep_self=True)
         topk_weights = topk_op.attr_process(e_weights)
@@ -167,9 +169,9 @@ class EdgeParam(nn.Module):
             graph.edge.param_layers[self.layer_key] = self
 
         e_feats = graph.edge_attrs['feats']
-        e_params = EdgeAttr('params', self.e_param_l(e_feats.value), e_feats.op)
         e_weights = graph.edge_attrs['weights']
-        e_params = e_weights.op.attr_process(e_params)
+        e_feats = e_weights.op.attr_process(e_feats)
+        e_params = EdgeAttr('params', self.e_param_l(e_feats.value), e_feats.op)
         graph.edge.edge_attrs['params'] = e_params
         return graph
 
@@ -237,14 +239,14 @@ class NodeFeat(nn.Module):
         node_feats = graph.node.node_feats('cat', self.drop_l)
 
         if self.method == 'film':
-            node_feats = self.feat_l(node_feats, graph.cond_feats)
+            node_feats = self.feat_l(node_feats, graph.cond_feats, graph.node.batch_ids)
         elif self.method == 'linear':
             node_feats = self.feat_l(node_feats)
         elif self.method == 'catLinear':
-            q_feats = self.q_feat_l(graph.cond_feats).unsqueeze(1)
+            q_feats = self.q_feat_l(cond_feats).unsqueeze(1)
             node_feats = self.feat_l(torch.cat((node_feats, q_feats.expand(-1, node_feats.size(1), -1)), dim=-1))
         elif self.method == 'mulLinear':
-            q_feats = self.q_feat_l(graph.cond_feats).unsqueeze(1)
+            q_feats = self.q_feat_l(cond_feats).unsqueeze(1)
             node_feats = self.node_feat_l(node_feats)
             node_feats = self.feat_l(q_feats*node_feats)
         else:
