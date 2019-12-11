@@ -29,7 +29,9 @@ class SpatialFeatureLoader:
 
 
 class ObjectsFeatureLoader:
-    def __init__(self, feature_dir):
+    obj_self = None
+
+    def __init__(self, feature_dir, load_mem=False):
         info_file = osp.join(feature_dir, 'gqa_objects_info.json')
         with open(info_file) as f:
             self.all_info = json.load(f)
@@ -37,7 +39,24 @@ class ObjectsFeatureLoader:
         num_files = len(glob(osp.join(feature_dir, 'gqa_objects_*.h5')))
         h5_paths = [osp.join(feature_dir, 'gqa_objects_%d.h5' % n)
                     for n in range(num_files)]
-        self.h5_files = [h5py.File(path, 'r') for path in h5_paths]
+        if load_mem:
+            self.h5_files = [self.load_h5(h5py.File(path, 'r')) for path in h5_paths]
+        else:
+            self.h5_files = [h5py.File(path, 'r') for path in h5_paths]
+        self.load_mem = load_mem
+
+    def load_h5(self, h5_file):
+        datas = {}
+        print('loading h5 datas')
+        for key in ('features', 'bboxes'):
+            datas[key] = h5_file[key].value
+        return datas
+
+    @classmethod
+    def build(cls, feat_dir, load_mem=False):
+        if cls.obj_self is None:
+            cls.obj_self = cls(feat_dir, load_mem)
+        return cls.obj_self
 
     def __del__(self):
         for f in self.h5_files:

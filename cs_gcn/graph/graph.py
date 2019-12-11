@@ -13,10 +13,12 @@ class Graph(object):
                  node_feats,
                  node_boxes=None,
                  node_masks=None,
+                 node_nums=None,
                  init_method: str = 'full',
                  cond_feats=None,
+                 **kwargs
                  ):
-        self.node = Node(self, node_feats, node_boxes, node_masks)
+        self.node = Node(self, node_feats, node_boxes, node_masks, node_nums, **kwargs)
         self.edge = Edge(self.node, init_method)
         self.cond_feats = cond_feats
         self.feats = list()

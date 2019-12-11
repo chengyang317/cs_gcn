@@ -9,7 +9,7 @@ __all__ = ['Node']
 class Node(object):
     caches = {}
 
-    def __init__(self, graph, node_feats, node_boxes=None, node_masks=None):
+    def __init__(self, graph, node_feats, node_boxes=None, node_masks=None, node_nums=None, **kwargs):
         self.graph = graph
         self.feat_layers = collections.defaultdict(None)
         self.logit_layers = {}
@@ -25,6 +25,8 @@ class Node(object):
             max_node_num = node_masks.sum(-1).max().item()
             self.feats = node_feats
             self.boxes = node_boxes
+            # self.boxes = kwargs['obj_boxes_debug'].squeeze()[:valid_node_num]
+            # self.boxes = node_boxes[node_masks]
             self.masks = node_masks[:, :max_node_num].contiguous()
             self.batch_num, self.node_num = self.masks.shape
             self.feat_num = node_feats.shape[-1]
@@ -33,6 +35,8 @@ class Node(object):
             self.batch_num, self.node_num, self.feat_num = node_feats.shape
             if node_masks is not None:
                 self.masks = node_masks
+                # self.feats = kwargs['obj_feats_debug'].squeeze(0)[:self.masks.sum().item()]
+                # self.boxes = kwargs['obj_boxes_debug'].squeeze(0)[:self.masks.sum().item()]
                 self.feats = node_feats[self.masks]
                 self.boxes = node_boxes[self.masks]
                 self.masks = self.masks[:, :self.max_node_num].contiguous()

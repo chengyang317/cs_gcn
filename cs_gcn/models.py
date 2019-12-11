@@ -8,6 +8,7 @@ from .graph import Graph
 import torch
 from torch.optim import Adam
 from .criterions import GqaCrossEntropy
+# import multiprocessing as mp
 
 
 class CGCNModel(pl.LightningModule):
@@ -61,10 +62,10 @@ class CGCNModel(pl.LightningModule):
         else:
             raise NotImplementedError()
 
-    def forward(self, obj_feats, obj_boxes, q_labels, q_nums, obj_masks=None):
+    def forward(self, obj_feats, obj_boxes, q_labels, q_nums, obj_masks=None, obj_nums=None, **kwargs):
         q_feats = self.q_layer(q_labels, q_nums)
 
-        graph = Graph(obj_feats, obj_boxes, obj_masks, self.hparams.g_init_method, cond_feats=q_feats)
+        graph = Graph(obj_feats, obj_boxes, obj_masks, obj_nums, self.hparams.g_init_method, cond_feats=q_feats, **kwargs)
 
         graph = self.g_stem_l(graph)
 
@@ -75,7 +76,6 @@ class CGCNModel(pl.LightningModule):
             pool_feats.append(graph.pool_feats(self.hparams.pool_method))
         v_feats = torch.cat(pool_feats, dim=-1)
         logits = self.g_cls_l(v_feats, graph.cond_feats)
-        del graph
         return logits
 
     def get_inputs(self, data_batch):
@@ -86,7 +86,8 @@ class CGCNModel(pl.LightningModule):
             return {'obj_feats': obj_feats, 'obj_boxes': obj_boxes, 'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens']}
         elif self.hparams.dataset == 'gqa_graph':
             return {'obj_feats': data_batch['img_obj_feats'], 'obj_boxes': data_batch['img_obj_boxes'],
-                    'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens'], 'obj_masks': data_batch['img_obj_masks']
+                    'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens'], 'obj_masks': data_batch['img_obj_masks'],
+                    'obj_boxes_debug': data_batch.get('img_obj_boxes_debug', None)
                     }
         else:
             raise NotImplementedError()
@@ -150,8 +151,7 @@ class CGCNModel(pl.LightningModule):
             from datasets.lcgn import load_train_data
             loader = load_train_data(self.hparams)
         elif self.hparams.dataset == 'gqa_graph':
-            gpu_num = len(self.hparams.gpus.split(','))
-            dataset = pt.GraphGqaDataset(gpu_num=gpu_num)
+            dataset = pt.GraphGqaDataset(gpu_num=len(self.hparams.gpus.split(',')), use_filter=True)
             loader = DataLoader(dataset, self.hparams.batch_size, True, num_workers=self.hparams.num_workers,
                                 collate_fn=dataset.collate_fn)
         else:
@@ -169,8 +169,7 @@ class CGCNModel(pl.LightningModule):
             from datasets.lcgn import load_eval_data
             loader = load_eval_data(self.hparams)
         elif self.hparams.dataset == 'gqa_graph':
-            gpu_num = len(self.hparams.gpus.split(','))
-            dataset = pt.GraphGqaDataset(split='val', gpu_num=gpu_num)
+            dataset = pt.GraphGqaDataset(split='val', gpu_num=len(self.hparams.gpus.split(',')), use_filter=True)
             loader = DataLoader(dataset, self.hparams.batch_size, False, num_workers=self.hparams.num_workers,
                                 collate_fn=dataset.collate_fn)
         else:
@@ -226,4 +225,6 @@ class CGCNModel(pl.LightningModule):
         parser.add_argument('--batch_size', default=55, type=int)
         parser.add_argument('--num_workers', default=0, type=int)
         parser.add_argument('--lr', default=2e-4, type=float)
+
+
         return parser

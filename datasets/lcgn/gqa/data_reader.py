@@ -9,6 +9,7 @@ from .feature_loader import SpatialFeatureLoader, ObjectsFeatureLoader, SceneGra
 import math
 import pt_pack as pt
 import torch
+from torch.utils.data import IterableDataset
 
 
 class GqaBatchLoader(object):
@@ -17,6 +18,8 @@ class GqaBatchLoader(object):
         self.work_dir = loader.work_dir
         self.anns = loader.anns
         self.params = params = loader.params
+        self.use_filter = params.use_filter
+        self.gpu_num = params.gpu_num
         self.batch_size = params.batch_size
         self.vocab_dict = text_processing.VocabDict(self.work_dir.joinpath('vocabulary_gqa.txt'))
         self.text_length = params.text_length
@@ -60,7 +63,7 @@ class GqaBatchLoader(object):
 
         if self.load_object_feat:
             objects_feature_dir = self.work_dir.joinpath('objects')
-            self.objects_loader = ObjectsFeatureLoader(objects_feature_dir)
+            self.objects_loader = ObjectsFeatureLoader.build(objects_feature_dir, params.load_mem)
             # load one feature map to peek its size
             self.obj_max_num = getattr(params, 'objects_max_num', 100)
             x, _ = self.objects_loader.load_feature(self.anns[0]['imageId'])
@@ -167,10 +170,26 @@ class GqaBatchLoader(object):
                     (objects_feat_batch, objects_bbox_tile), axis=-1)
             else:
                 image_feat_batch = objects_feat_batch
-        max_node_num = max(node_nums)
+        # max_node_num = max(node_nums)
         batch = {key: value for key, value in batch.items() if key in self.req_field_names}
-        for key in ('obj_feats', 'obj_boxes', 'obj_masks'):
-            batch[key] = batch[key][:, :max_node_num]
+
+        if self.use_filter:
+            batch = self.filter_obj_attr(batch)
+
+        # for key in ('obj_feats', 'obj_boxes', 'obj_masks'):
+        #     batch[key] = batch[key][:, :max_node_num]
+        return batch
+
+    def filter_obj_attr(self, batch):
+        if self.gpu_num is not None:
+            gpu_masks = batch['obj_masks'].chunk(self.gpu_num, dim=0)
+            node_nums = [mask.sum().item() for mask in gpu_masks]
+            feats = torch.cat([batch['obj_feats'], batch['obj_boxes']], dim=-1)
+            ret_feats = torch.zeros((self.gpu_num, max(node_nums), feats.shape[-1]), dtype=torch.float32)
+            b_feats = feats.chunk(self.gpu_num, dim=0)
+            for g_id, b_mask in enumerate(gpu_masks):
+                ret_feats[g_id, :node_nums[g_id]] = b_feats[g_id][b_mask]
+            batch['img_obj_feats'], batch['img_obj_boxes'] = ret_feats.split((ret_feats.shape[-1]-4, 4), dim=-1)
         return batch
 
     def __len__(self):
@@ -186,6 +205,12 @@ class GqaLoader(object):
                                        )
         if getattr(params, 'data_dir', None) is None:
             params.data_dir = 'work_dir/data/gqa_lcgn'
+        if getattr(params, 'use_filter', None) is None:
+            params.use_filter = True
+            params.gpu_num = len(params.gpus.split(','))
+        if getattr(params, 'use_thread', None) is None:
+            params.use_thread = True
+        self.use_thread = params.use_thread
         self.work_dir = pt.to_path(params.data_dir)
         text_length = getattr(params, 'text_length', 30)
         params.text_length = text_length
@@ -214,29 +239,33 @@ class GqaLoader(object):
         self.prefetch_num = params.prefetch_num
         self.batch_loader = GqaBatchLoader(self)
 
+        if self.use_thread:
         # Start prefetching thread
-        self.prefetch_queue = queue.Queue(maxsize=self.prefetch_num)
-        self.prefetch_thread = threading.Thread(
-            target=_run_prefetch, args=(self.prefetch_queue, self.batch_loader, self.anns, self.shuffle, self.params)
-        )
-        self.prefetch_thread.daemon = True
-        self.prefetch_thread.start()
+            self.prefetch_queue = queue.Queue(maxsize=self.prefetch_num)
+            self.prefetch_thread = threading.Thread(
+                target=_run_prefetch, args=(self.prefetch_queue, self.batch_loader, self.anns, self.shuffle, self.params)
+            )
+            self.prefetch_thread.daemon = True
+            self.prefetch_thread.start()
 
     def batches(self, one_pass=False):
-        while True:
-            # Get a batch from the prefetching queue
-            # if self.prefetch_queue.empty():
-            #     print('data reader: waiting for IO...')
-            batch, n_sample, n_epoch = self.prefetch_queue.get(block=True)
-            if batch is None:
-                if one_pass:
-                    return
-                else:
-                    # get the next batch
-                    batch, n_sample, n_epoch = self.prefetch_queue.get(
-                        block=True)
-            # yield (batch, n_sample, n_epoch)
-            return batch
+        if self.use_thread:
+            while True:
+                # Get a batch from the prefetching queue
+                # if self.prefetch_queue.empty():
+                #     print('data reader: waiting for IO...')
+                batch, n_sample, n_epoch = self.prefetch_queue.get(block=True)
+                if batch is None:
+                    if one_pass:
+                        return
+                    else:
+                        # get the next batch
+                        batch, n_sample, n_epoch = self.prefetch_queue.get(
+                            block=True)
+                # yield (batch, n_sample, n_epoch)
+                return batch
+        else:
+            return self.batch_loader.load_one_batch()
 
     def __iter__(self):
         self.iter_batch_ids = iter(range(len(self)))

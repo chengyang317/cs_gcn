@@ -8,7 +8,6 @@ import torch
 import numpy as np
 import random
 import torch.backends.cudnn as cudnn
-# import multiprocessing as mp
 
 
 def get_args():
@@ -16,13 +15,14 @@ def get_args():
     parser.add_argument('--work_dir', metavar='DIR', default="./work_dir", type=str, help='path to save output')
     parser.add_argument('--name', type=str)
     parser.add_argument('--gpus', type=str, default='7', help='how many gpus')
-    parser.add_argument('--dist_bd', type=str, choices=('dp', 'ddp', 'ddp2'),
+    parser.add_argument('--dist_bd', type=str, default='dp',  choices=('dp', 'ddp', 'ddp2'),
                                help='supports three options dp, ddp, ddp2')
     parser.add_argument('--use_16bit', dest='use_16bit', action='store_true',
                                help='if true uses 16 bit precision')
     parser.add_argument('--eval', '--evaluate', dest='evaluate', action='store_true',
                                help='evaluate model on validation set')
     parser.add_argument('--seed', default=1, type=int)
+    parser.add_argument('--load_mem', action='store_true')
 
     parser = CGCNModel.add_model_specific_args(parser)
     return parser.parse_args()
@@ -52,10 +52,10 @@ def main(params):
         max_nb_epochs=params.epochs,
         distributed_backend=params.dist_bd,
         use_amp=params.use_16bit,
-        nb_sanity_val_steps=0,
+        # nb_sanity_val_steps=0,
         # val_check_interval=0.01,
         # val_percent_check=0.01,
-        # train_percent_check=0.005,
+        # train_percent_check=0.002,
         # early_stop_callback=False,
     )
     if params.evaluate:
