@@ -4,10 +4,6 @@ import pytorch_lightning as pl
 from test_tube import HyperOptArgumentParser
 from cs_gcn.models import CGCNModel
 from pytorch_lightning.logging import TestTubeLogger
-import torch
-import numpy as np
-import random
-import torch.backends.cudnn as cudnn
 
 
 def get_args():
@@ -29,6 +25,10 @@ def get_args():
 
 
 def init_seed(params):
+    import torch
+    import numpy as np
+    import random
+    import torch.backends.cudnn as cudnn
     random.seed(params.seed)
     torch.manual_seed(params.seed)
     random.seed(params.seed)
@@ -38,12 +38,20 @@ def init_seed(params):
     cudnn.deterministic = True
 
 
-def main(params):
+def main(params, gpus=None, results_dict=None):
     init_seed(params)
     params.padding_idx = 0
 
+    if params.work_dir == './work_dir':
+        params.work_dir = params.work_dir + f'/{params.dataset}'
+    if params.name is not None:
+        params.name = f'{params.name}_lr^{params.lr}'
+
     logger = TestTubeLogger(params.work_dir, name=params.name)
     model = CGCNModel(params)
+
+    gpu_num = len(params.gpus.split(','))
+    params.lr = params.lr * gpu_num
 
     trainer = pl.Trainer(
         logger=logger,
@@ -54,9 +62,11 @@ def main(params):
         use_amp=params.use_16bit,
         # nb_sanity_val_steps=0,
         # val_check_interval=0.01,
-        # val_percent_check=0.01,
-        # train_percent_check=0.002,
-        # early_stop_callback=False,
+        # val_percent_check=0.0001,
+        # train_percent_check=0.001,
+        early_stop_callback=False,
+        # log_gpu_memory='all',
+        max_epochs=params.epochs
     )
     if params.evaluate:
         trainer.run_evaluation()
@@ -65,10 +75,11 @@ def main(params):
 
 
 if __name__ == '__main__':
-    # mp.set_start_method('spawn', force=True)
-    main(get_args())
-
-
+    params = get_args()
+    main(params)
+    # params.optimize_parallel_gpu(main, gpu_ids=['5', '6', '7'], )
+    for trial_hparams in params.trials(10):
+        main(params)
 
 
 

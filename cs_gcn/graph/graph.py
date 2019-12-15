@@ -16,9 +16,8 @@ class Graph(object):
                  node_nums=None,
                  init_method: str = 'full',
                  cond_feats=None,
-                 **kwargs
                  ):
-        self.node = Node(self, node_feats, node_boxes, node_masks, node_nums, **kwargs)
+        self.node = Node(node_feats, node_boxes, node_masks, node_nums)
         self.edge = Edge(self.node, init_method)
         self.cond_feats = cond_feats
         self.feats = list()
@@ -49,6 +48,17 @@ class Graph(object):
 
     def clear(self):
         self.edge.clear_ops()
+
+    def check(self):
+        for obj in (self.node, self.edge):
+            for key, value in obj.caches.items():
+                if not torch.is_tensor(value):
+                    for item in value:
+                        if item.is_cuda:
+                            raise RuntimeError()
+                else:
+                    if value.is_cuda:
+                        raise RuntimeError()
 
     def pool_feats(self, method='mean'):
         if 'weight' in method:

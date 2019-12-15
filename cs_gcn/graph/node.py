@@ -9,11 +9,15 @@ __all__ = ['Node']
 class Node(object):
     caches = {}
 
-    def __init__(self, graph, node_feats, node_boxes=None, node_masks=None, node_nums=None, **kwargs):
-        self.graph = graph
+    def __init__(self, node_feats, node_boxes=None, node_masks=None, node_nums=None):
         self.feat_layers = collections.defaultdict(None)
         self.logit_layers = {}
         self.logits = None
+        if node_nums is not None:
+            self.batch_num, self.node_num = node_nums.shape[0], node_nums.max().item()
+            node_masks = self.node_num_cache.cuda(node_nums.device) < node_nums[:, None]
+        if node_boxes is None:
+            node_feats, node_boxes = node_feats.split((node_feats.size(-1)-4, 4), dim=-1)
         if node_feats.shape[0] == 1:
             node_feats = node_feats.squeeze(0)
             node_boxes = node_boxes.squeeze(0)
@@ -25,12 +29,11 @@ class Node(object):
             max_node_num = node_masks.sum(-1).max().item()
             self.feats = node_feats
             self.boxes = node_boxes
-            # self.boxes = kwargs['obj_boxes_debug'].squeeze()[:valid_node_num]
+            # self.boxes = kwargs['obj_boxes_sparse'].squeeze()[:valid_node_num].clone()
             # self.boxes = node_boxes[node_masks]
             self.masks = node_masks[:, :max_node_num].contiguous()
             self.batch_num, self.node_num = self.masks.shape
             self.feat_num = node_feats.shape[-1]
-
         else:
             self.batch_num, self.node_num, self.feat_num = node_feats.shape
             if node_masks is not None:
@@ -107,15 +110,12 @@ class Node(object):
     def node_feats(self, method='clean', drop_l=None):
         node_feats = drop_l(self.feats) if drop_l is not None else self.feats
         if method == 'cat':
-            return torch.cat([node_feats, *self.size_center()], dim=-1)
+            box_feats = torch.cat([*self.size_center(), self.boxes], dim=-1).repeat(1, 8)
+            return torch.cat([node_feats, box_feats], dim=-1)
         elif method == 'clean':
             return self.feats
         else:
             raise NotImplementedError()
-
-    @property
-    def edge(self):
-        return self.graph.edge
 
     @property
     def device(self):
@@ -128,10 +128,6 @@ class Node(object):
             self.boxes = node_coords
         if node_weights is not None:
             self.weights = node_weights
-
-    @property
-    def shape(self):
-        return self.feats.shape
 
     def size_center(self):
         if self._box_size is None:

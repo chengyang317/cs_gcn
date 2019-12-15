@@ -1,7 +1,7 @@
 import torch.nn as nn
 import pt_pack as pt
 import torch
-from .graph.edge import EdgeAttr
+from .graph.edge import EdgeAttr, EdgeTopK
 from .graph import Graph
 
 
@@ -18,7 +18,12 @@ class FilmFusion(nn.Module):
                  act_type: str = 'relu'
                  ):
         super().__init__()
-        self.cond_proj_l = nn.utils.weight_norm(nn.Linear(cond_dim, out_dim*2))
+        # self.cond_proj_l = nn.utils.weight_norm(nn.Linear(cond_dim, out_dim*2))
+        self.cond_proj_l = nn.Sequential(
+            nn.Linear(cond_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.Linear(out_dim, out_dim*2)
+        )
         self.drop_l = nn.Dropout(dropout)
         self.film_l = pt.Linear(in_dim, out_dim, norm_type=norm_type, norm_affine=False, orders=('linear', 'norm', 'cond'))
         self.act_l = pt.Act(act_type)
@@ -51,15 +56,16 @@ class EdgeFeat(nn.Module):
             return
         self.n2n, self.n2c = method.split('_')
         self.n_proj = nn.Sequential(
-            nn.utils.weight_norm(nn.Linear(node_dim+4, edge_dim)),
-            nn.ReLU()
+            nn.Linear(node_dim+64, edge_dim),
+            nn.Dropout(dropout),
+            nn.LayerNorm(edge_dim)
         )
         self.e_geo_linear = nn.Sequential(
-            nn.utils.weight_norm(nn.Linear(8, 30)),
-            nn.ReLU()
+            nn.Linear(64, 128),
+            nn.LayerNorm(128)
         )
         self.drop_l = nn.Dropout(dropout)
-        join_dim = edge_dim + 30 if self.n2n in ('sum', 'mul', 'max') else edge_dim * 2 + 30
+        join_dim = edge_dim + 128 if self.n2n in ('sum', 'mul', 'max') else edge_dim * 2 + 128
         self.n2c_fusion = FilmFusion(join_dim, cond_dim, edge_dim)
 
     @property
@@ -67,29 +73,29 @@ class EdgeFeat(nn.Module):
         return f'{self.node_dim}_{self.cond_dim}_{self.edge_dim}'
 
     def forward(self, graph):
+        node, edge = graph.node, graph.edge
         if self.method == 'none':
             return graph
         elif self.method == 'share':
             e_feat_l = graph.edge.feat_layers[self.layer_key]
             return e_feat_l(graph)
-        # b_num, n_num = graph.batch_num, graph.node_num
-        node_feats = self.n_proj(graph.node.node_feats('cat', self.drop_l))
+        if self.layer_key not in graph.edge.feat_layers:
+            graph.edge.feat_layers[self.layer_key] = self
+
+        node_feats = self.n_proj(node.node_feats('cat'))
         n_join_feats = graph.edge.combine_node_attr(node_feats, self.n2n)
 
         if graph.edge.geo_layer is None:
             graph.edge.geo_layer = self.e_geo_linear
-        e_geo_feats = graph.edge.geo_layer(graph.edge.geo_feats())
+        e_geo_feats = graph.edge.geo_layer(graph.edge.geo_feats(node).repeat(1, 8))
         join_feats = torch.cat((n_join_feats, e_geo_feats), dim=-1)
 
         if self.n2c == 'film':
-            e_feats = self.n2c_fusion(join_feats, graph.cond_feats, graph.edge.batch_ids())
+            e_feats = self.n2c_fusion(join_feats, graph.cond_feats, edge.batch_ids(node))
         else:
             raise NotImplementedError()
-        graph.edge.edge_attrs['feats'] = EdgeAttr('feats', e_feats, graph.edge.init_op())
-
-        if self.layer_key not in graph.edge.feat_layers:
-            graph.edge.feat_layers[self.layer_key] = self
-        return graph
+        e_feats = EdgeAttr('feats', e_feats, graph.edge.name)
+        return e_feats
 
 
 class EdgeWeight(nn.Module):
@@ -105,10 +111,12 @@ class EdgeWeight(nn.Module):
             self.score_l = None
         elif self.score_method == 'linear':
             self.score_l = nn.Sequential(
+                nn.Linear(edge_dim, edge_dim),
                 nn.Dropout(dropout),
-                nn.utils.weight_norm(nn.Linear(edge_dim, edge_dim//2)),
-                nn.ReLU(),
-                nn.utils.weight_norm(nn.Linear(edge_dim//2, 1))
+                nn.LayerNorm(edge_dim),
+                nn.Linear(edge_dim, edge_dim//2),
+                nn.GLU(),
+                nn.Linear(edge_dim//4, 1),
             )
         else:
             raise NotImplementedError()
@@ -117,20 +125,19 @@ class EdgeWeight(nn.Module):
     def layer_key(self):
         return f'{self.edge_dim}'
 
-    def forward(self, graph: Graph):
+    def forward(self, graph: Graph, e_feats):
         edge = graph.edge
         score_l = self.score_l or edge.score_layers[self.layer_key]
         if self.layer_key not in edge.score_layers:
             edge.score_layers[self.layer_key] = self.score_l
 
-        e_feats = edge.edge_attrs['feats']
-        e_scores = EdgeAttr('scores', score_l(e_feats.value), e_feats.op)
-        # edge.edge_attrs['scores'] = e_scores
-        e_weights = e_scores.op.norm_attr(e_scores.value, self.norm_method)
-        topk_op = edge.topk_op(e_weights, self.reduce_size, keep_self=True)
+        e_scores = EdgeAttr('scores', score_l(e_feats.value), e_feats.op_name)
+        op = edge.load_op(e_scores.op_name)
+        e_weights = op.norm_attr(e_scores.value, self.norm_method)
+        topk_op = EdgeTopK(e_weights, self.reduce_size, edge, keep_self=True)
         topk_weights = topk_op.attr_process(e_weights)
-        graph.edge.edge_attrs['weights'] = EdgeAttr('weights', topk_weights, topk_op)
-        return graph
+        e_weights = EdgeAttr('weights', topk_weights, topk_op.name)
+        return e_weights
 
 
 class EdgeParam(nn.Module):
@@ -148,18 +155,20 @@ class EdgeParam(nn.Module):
             return
         else:
             self.e_param_l = nn.Sequential(
+                nn.Linear(edge_dim, edge_dim),
                 nn.Dropout(dropout),
-                nn.utils.weight_norm(nn.Linear(edge_dim, out_dim//2)),
-                nn.ReLU(),
-                nn.utils.weight_norm(nn.Linear(out_dim//2, out_dim)),
-                nn.Tanh()
+                nn.LayerNorm(edge_dim),
+                nn.Linear(edge_dim, edge_dim),
+                nn.GLU(),
+                nn.Linear(edge_dim//2, out_dim),
+                nn.Tanh(),
             )
 
     @property
     def layer_key(self):
         return f'{self.edge_dim}_{self.out_dim}'
 
-    def forward(self, graph: Graph):
+    def forward(self, graph: Graph, e_feats):
         if self.method == 'none':
             return graph
         elif self.method == 'share':
@@ -168,12 +177,8 @@ class EdgeParam(nn.Module):
         if self.layer_key not in graph.edge.param_layers:
             graph.edge.param_layers[self.layer_key] = self
 
-        e_feats = graph.edge_attrs['feats']
-        e_weights = graph.edge_attrs['weights']
-        e_feats = e_weights.op.attr_process(e_feats)
-        e_params = EdgeAttr('params', self.e_param_l(e_feats.value), e_feats.op)
-        graph.edge.edge_attrs['params'] = e_params
-        return graph
+        e_params = EdgeAttr('params', self.e_param_l(e_feats.value), e_feats.op_name)
+        return e_params
 
 
 class NodeFeat(nn.Module):
@@ -192,7 +197,7 @@ class NodeFeat(nn.Module):
         if method in ('none', 'share'):
             return
         elif self.method == 'film':
-            self.feat_l = FilmFusion(node_dim+4, cond_dim, out_dim)
+            self.feat_l = FilmFusion(node_dim+64, cond_dim, out_dim)
         elif self.method == 'linear':
             self.feat_l = nn.Sequential(
                 nn.utils.weight_norm(nn.Linear(node_dim, out_dim//2)),
@@ -230,6 +235,7 @@ class NodeFeat(nn.Module):
         return f'{self.node_dim}_{self.cond_dim}'
 
     def forward(self, graph: Graph):
+        node, edge = graph.node, graph.edge
         if self.method == 'share':
             n_feat_l = graph.node.feat_layers[self.layer_key]
             return n_feat_l(graph)
@@ -239,7 +245,7 @@ class NodeFeat(nn.Module):
         node_feats = graph.node.node_feats('cat', self.drop_l)
 
         if self.method == 'film':
-            node_feats = self.feat_l(node_feats, graph.cond_feats, graph.node.batch_ids)
+            node_feats = self.feat_l(node_feats, graph.cond_feats, node.batch_ids)
         elif self.method == 'linear':
             node_feats = self.feat_l(node_feats)
         elif self.method == 'catLinear':
@@ -252,8 +258,7 @@ class NodeFeat(nn.Module):
         else:
             raise NotImplementedError()
 
-        graph.node.update_feats(node_feats)
-        return graph
+        return node_feats
 
 
 

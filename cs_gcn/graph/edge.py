@@ -8,29 +8,24 @@ import torch_scatter as ts
 __all__ = ['Edge', 'EdgeAttr', 'EdgeNull', 'EdgeTopK']
 
 
-EdgeAttr = collections.namedtuple('EdgeAttr', ['name', 'value', 'op'])
+EdgeAttr = collections.namedtuple('EdgeAttr', ['name', 'value', 'op_name'])
 
 
 class EdgeOp(object):
     op_name = 'BASE'
     caches = {}
 
-    def __init__(self, name, last_op):
+    def __init__(self, name, last_op=None):
         self.name = name or self.op_name
-        self.last_op = last_op
-        self.node = None
-        if last_op is not None:
-            last_op.register_op(self)
-            self.node = last_op.node
-        self.edge_attrs: Dict[str, EdgeAttr] = {}
         self.next_ops = {}
         self.node_i_ids, self.node_j_ids = None, None
-        self.mask = None
+        self.masks = None
         # self.select_ids = None
-        self.op_process()
-
-    def op_process(self):
-        raise NotImplementedError()
+        self.batch_num, self.node_num, self.device = None, None, None
+        # self.last_op = last_op
+        if last_op is not None:
+            last_op.register_op(self)
+            self.batch_num, self.node_num, self.device = last_op.batch_num, last_op.node_num, last_op.device
 
     def _attr_process(self, attr: torch.Tensor):
         raise NotImplementedError
@@ -39,35 +34,16 @@ class EdgeOp(object):
         if attr is None:
             return None
         if isinstance(attr, EdgeAttr):
-            if attr.op.name == self.last_op.name:
-                attr_value = self._attr_process(attr.value)
-            elif attr.op.name == self.name:
-                return attr
-            else:
-                attr_value = self._attr_process(self.last_op.attr_process(attr).value)
+            attr_value = self._attr_process(attr.value)
             return EdgeAttr(attr.name, attr_value, self)
         return self._attr_process(attr)
-
-    @property
-    def node_num(self):
-        return self.node.node_num
-
-    @property
-    def batch_num(self):
-        return self.node.batch_num
-
-    @property
-    def graph(self):
-        return self.node.graph
-
-    @property
-    def device(self):
-        return self.node.device
 
     def register_op(self, op):
         self.next_ops[op.name] = op
 
     def load_op(self, op_name):
+        if op_name == self.name:
+            return self
         return self.next_ops.get(op_name, None)
 
     @property
@@ -76,7 +52,6 @@ class EdgeOp(object):
 
     def clear_ops(self):
         self.next_ops = {}
-        self.edge_attrs = {}
 
     def norm_attr(self, edge_attr, norm_method):
         edge_attr = edge_attr.view(-1, edge_attr.size(-1))
@@ -154,17 +129,17 @@ class EdgeOp(object):
             raise NotImplementedError()
         return joint_feats
 
-    def batch_ids(self):
-        return self.node.batch_ids[self.node_j_ids]
+    def batch_ids(self, node):
+        return node.batch_ids[self.node_j_ids]
 
-    def expand_cond_attr(self, cond_attr):
+    def expand_cond_attr(self, cond_attr, node):
         """
 
         :param cond_attr: b,c
         :return:
         """
-        if self.mask is not None:
-            return cond_attr[self.batch_ids()]
+        if self.masks is not None:
+            return cond_attr[self.batch_ids(node)]
         else:
             return cond_attr.view(self.batch_num, 1, 1, cond_attr.size(-1)).repeat(1, self.node_num, self.node_num, 1).view(-1, cond_attr.size(-1))
 
@@ -172,20 +147,19 @@ class EdgeOp(object):
         if edge_attr.dim() == 1:
             edge_attr = edge_attr.view(-1, 1)
         c_dim = edge_attr.size(-1)
-        if self.mask is None:
+        if self.masks is None:
             return edge_attr.view(self.batch_num, self.node_num, -1, c_dim)
         new_attr = edge_attr.new_full((self.batch_num, self.node_num, self.node_num, c_dim), fill_value)
         # new_attr = new_attr.masked_fill(self.mask.unsqueeze(-1), edge_attr)
-        new_attr[self.mask] = edge_attr
+        new_attr[self.masks] = edge_attr
         return new_attr
 
 
 class EdgeNull(EdgeOp):
     op_name = 'NULL'
 
-    def __init__(self, node):
+    def __init__(self):
         super().__init__('null', None)
-        self.node = node
 
     def attr_process(self, attr):
         if attr is None:
@@ -194,31 +168,30 @@ class EdgeNull(EdgeOp):
             assert isinstance(attr.op, EdgeNull)
         return attr
 
-    def op_process(self):
-        pass
-
 
 class EdgeInit(EdgeOp):
     op_name = 'INIT'
     ids_cache = {}
 
     def __init__(self, method: str, node):
+        super().__init__(f'init_{method}')
         self.method = method
-        super().__init__(f'init_{method}', EdgeNull(node))
+        self.op_process(node)
 
-    def op_process(self):
-        if self.node.masks is None and self.method == 'full':
-            self.mask = None
-        elif self.node.masks is None:
-            self.mask = self.init_mask()
+    def op_process(self, node):
+        self.batch_num, self.node_num, self.device = node.batch_num, node.node_num, node.device
+        if node.masks is None and self.method == 'full':
+            self.masks = None
+        elif node.masks is None:
+            self.masks = self.init_masks()
         else:
-            self.mask = node_intersect(self.node.masks.unsqueeze(-1), 'mul').squeeze(-1) * self.init_mask()
+            self.masks = node_intersect(node.masks.unsqueeze(-1), 'mul').squeeze(-1) * self.init_masks()
         node_i, node_j = self.meshgrid_cache  # b, n, n
-        if self.mask is not None:
-            node_i, node_j = node_i.cuda(self.device)[self.mask], node_j.cuda(self.device)[self.mask]  # k, k
+        if self.masks is not None:
+            node_i, node_j = node_i.cuda(self.device)[self.masks], node_j.cuda(self.device)[self.masks]  # k, k
         else:
             node_i, node_j = node_i.view(-1).cuda(self.device), node_j.view(-1).cuda(self.device)
-        self.node_i_ids, self.node_j_ids = self.node.map_idx(node_i), self.node.map_idx(node_j)
+        self.node_i_ids, self.node_j_ids = node.map_idx(node_i), node.map_idx(node_j)
 
         # if self.mask is None:
         #     self.select_ids = torch.arange(len(self.node_i_ids), device=self.device)
@@ -230,7 +203,7 @@ class EdgeInit(EdgeOp):
         assert attr.shape[0] == self.node_num * self.node_num * self.batch_num
         return attr[self.select_ids]
 
-    def init_mask(self):
+    def init_masks(self):
         if self.method == 'full':
             return self.full_mask_cache.cuda(self.device)
         elif self.method == 'not_eye':
@@ -243,20 +216,19 @@ class EdgeTopK(EdgeOp):
     op_name = 'TOPK'
 
     def __init__(self, by_attr: torch.Tensor, reduce_size, last_op, name=None, keep_self=False):
-        self.by_attr = by_attr
-        min_node_num = last_op.node.min_node_num
-        if reduce_size > min_node_num:
-            print(f'reduce_size warning')
-            raise IndexError()
-        self.reduce_size = min(reduce_size, min_node_num)
+        super().__init__(name or f'top_{reduce_size}', last_op)
+        # min_node_num = last_op.node.min_node_num
+        # if reduce_size > min_node_num:
+        #     print(f'reduce_size warning')
+        #     raise IndexError()
+        # self.reduce_size = min(reduce_size, min_node_num)
+        self.reduce_size = reduce_size
         self.top_ids = None
         self.l_select_ids = None
         self.keep_self = keep_self
-        name = name or f'top_{reduce_size}'
-        super().__init__(name, last_op)
+        self.op_process(by_attr, last_op)
 
-    def op_process(self):
-        by_attr, last_op = self.by_attr, self.last_op
+    def op_process(self, by_attr, last_op):
         fake_by_attr = last_op.origin_reshape(by_attr, fill_value=-1e3)
         self.top_ids = self.attr_topk(fake_by_attr, -2, self.reduce_size, keep_self=self.keep_self)
 
@@ -266,7 +238,6 @@ class EdgeTopK(EdgeOp):
         self.node_i_ids, self.node_j_ids = self._attr_process(last_op.node_i_ids), self._attr_process(
             last_op.node_j_ids)
         # self.select_ids = self._attr_process(last_op.select_ids)
-        self.by_attr = None
 
     def attr_topk(self, attr, dim, reduce_size=-1, keep_self=False):
         """
@@ -307,28 +278,12 @@ class Edge(EdgeInit):
                  init_method: str,
                  ):
         super().__init__(init_method, node)
-        self.edge_attrs = {
-            'feats': None, 'params': None, 'weights': None, 'scores': None
-        }
         self.geo_layer = None
         self.feat_layers, self.score_layers, self.param_layers = {}, {}, {}
 
-    def init_op(self):
-        return self
-
-    def topk_op(self, by_attr=None, reduce_size=None, keep_self=True) -> EdgeTopK:
-        if reduce_size is None:
-            for op_name, op in self.next_ops.items():
-                if 'top' in op_name:
-                    return op
-            raise NotImplementedError()
-        if f'top_{reduce_size}' not in self.next_ops:
-            EdgeTopK(by_attr, reduce_size, self, f'top_{reduce_size}', keep_self=keep_self)
-        return self.next_ops[f'top_{reduce_size}']
-
-    def geo_feats(self):
-        node_size, _ = self.node.size_center()
-        node_i_box, node_j_box = self.expand_node_attr(self.node.boxes)
+    def geo_feats(self, node):
+        node_size, _ = node.size_center()
+        node_i_box, node_j_box = self.expand_node_attr(node.boxes)
         node_i_size, node_j_size = self.expand_node_attr(node_size)
 
         node_dist = node_i_box - node_j_box

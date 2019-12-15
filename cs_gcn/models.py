@@ -7,8 +7,8 @@ import torch.nn as nn
 from .graph import Graph
 import torch
 from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from .criterions import GqaCrossEntropy
-# import multiprocessing as mp
 
 
 class CGCNModel(pl.LightningModule):
@@ -62,13 +62,10 @@ class CGCNModel(pl.LightningModule):
         else:
             raise NotImplementedError()
 
-    def forward(self, obj_feats, obj_boxes, q_labels, q_nums, obj_masks=None, obj_nums=None, **kwargs):
+    def forward(self, obj_feats, obj_boxes, q_labels, q_nums, obj_masks=None, obj_nums=None):
         q_feats = self.q_layer(q_labels, q_nums)
-
-        graph = Graph(obj_feats, obj_boxes, obj_masks, obj_nums, self.hparams.g_init_method, cond_feats=q_feats, **kwargs)
-
+        graph = Graph(obj_feats, obj_boxes, obj_masks, obj_nums, self.hparams.g_init_method, cond_feats=q_feats)
         graph = self.g_stem_l(graph)
-
         pool_feats = list()
         for conv_l in self.g_conv_layers:
             graph.clear()
@@ -80,24 +77,24 @@ class CGCNModel(pl.LightningModule):
 
     def get_inputs(self, data_batch):
         if self.hparams.dataset == 'gqa_lcgn':
-            return {key: data_batch.get(key, None) for key in ('obj_feats', 'obj_boxes', 'q_labels', 'q_nums', 'obj_masks')}
+            return {key: data_batch.get(key, None) for key in ('obj_feats', 'obj_boxes', 'q_labels', 'q_nums', 'obj_masks')}, {'a_labels': data_batch['a_labels']}
         elif self.hparams.dataset == 'vqa2_cp':
             obj_feats, obj_boxes = data_batch['img_obj_feats'].split((2048, 4), dim=-1)
-            return {'obj_feats': obj_feats, 'obj_boxes': obj_boxes, 'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens']}
+            return {'obj_feats': obj_feats, 'obj_boxes': obj_boxes, 'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens']}, \
+                   {'a_label_scores': data_batch['a_label_scores'], 'a_label_counts': data_batch['a_label_counts']}
         elif self.hparams.dataset == 'gqa_graph':
-            return {'obj_feats': data_batch['img_obj_feats'], 'obj_boxes': data_batch['img_obj_boxes'],
-                    'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens'], 'obj_masks': data_batch['img_obj_masks'],
-                    'obj_boxes_debug': data_batch.get('img_obj_boxes_debug', None)
-                    }
+            return {'obj_feats': data_batch['img_obj_feats'], 'obj_boxes': data_batch.get('img_obj_boxes', None),
+                    'q_labels': data_batch['q_labels'], 'q_nums': data_batch['q_lens'], 'obj_nums': data_batch['img_obj_nums'],
+                    }, {'a_labels': data_batch['a_labels']}
         else:
             raise NotImplementedError()
 
     def training_step(self, data_batch, batch_nb):
-        logits = self.forward(**self.get_inputs(data_batch))
-        if self.hparams.dataset in ('gqa_lcgn', 'gqa_graph'):
-            loss, acc = self.criterion(logits, data_batch['a_labels'])
-        elif self.hparams.dataset == 'vqa2_cp':
-            loss, acc = self.criterion(logits, data_batch['a_label_scores'], data_batch['a_label_counts'])
+        forward_inputs, criterion_inputs = self.get_inputs(data_batch)
+        logits = self.forward(**forward_inputs)
+        # del forward_inputs
+        loss, acc = self.criterion(logits, **criterion_inputs)
+        # del criterion_inputs
         output = {'loss': loss, 'acc': acc}
         return output
 
@@ -110,11 +107,11 @@ class CGCNModel(pl.LightningModule):
         return output
 
     def validation_step(self, data_batch, batch_nb):
-        logits = self.forward(**self.get_inputs(data_batch))
-        if self.hparams.dataset in ('gqa_lcgn', 'gqa_graph'):
-            loss, acc = self.criterion(logits, data_batch['a_labels'])
-        elif self.hparams.dataset == 'vqa2_cp':
-            loss, acc = self.criterion(logits, data_batch['a_label_scores'], data_batch['a_label_counts'])
+        forward_inputs, criterion_inputs = self.get_inputs(data_batch)
+        logits = self.forward(**forward_inputs)
+        # del forward_inputs
+        loss, acc = self.criterion(logits, **criterion_inputs)
+        # del criterion_inputs
         return {'val_loss': loss, 'val_acc': acc}
 
     def validation_end(self, outputs):
@@ -132,14 +129,16 @@ class CGCNModel(pl.LightningModule):
         results = {
             'progress_bar': tqdm_dict,
             'log': tqdm_dict,
-            'val_loss': tqdm_dict['val_loss'],
-            'val_acc': tqdm_dict['val_acc']
+            'val_loss': val_loss_mean,
+            'val_acc': val_acc_mean
         }
+        self.logger.experiment.add_scalar('val_epoch_acc', val_acc_mean.item(), self.current_epoch)
         return results
 
     def configure_optimizers(self):
         optim = Adam(self.parameters(), lr=self.hparams.lr)
-        return optim
+        sched = ReduceLROnPlateau(optim, patience=0, factor=0.2, verbose=True)
+        return [optim], [sched]
 
     @pl.data_loader
     def train_dataloader(self):
@@ -221,10 +220,10 @@ class CGCNModel(pl.LightningModule):
         parser.opt_list('--pool_method', default='mix', options=['mix', 'mean', 'max'], type=str)
 
         parser.opt_list('--dataset', default='vqa2_cp', type=str, options=['vaq2_cp', 'gqa_lcgn'])
-        parser.add_argument('--epochs', default=20, type=int)
+        parser.add_argument('--epochs', default=14, type=int)
         parser.add_argument('--batch_size', default=55, type=int)
         parser.add_argument('--num_workers', default=0, type=int)
-        parser.add_argument('--lr', default=2e-4, type=float)
+        parser.opt_list('--lr', default=3e-4, type=float, options=[3e-4, 4e-4, 2e-4, 5e-4, 1e-4, 6e-4], tunable=True)
 
 
         return parser

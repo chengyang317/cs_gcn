@@ -38,19 +38,24 @@ class GraphStemLayer(nn.Module):
         super().__init__()
         if method == 'linear':
             self.linear_l = nn.Sequential(
-                nn.utils.weight_norm(nn.Linear(node_dim+4, out_dim)),
-                nn.ReLU(),
+                # do we need normlization here like lcgn?
+                # nn.utils.weight_norm(nn.Linear(node_dim+4, out_dim)),
+                nn.Linear(node_dim+64, out_dim),
+                nn.GLU(),
+                nn.Linear(out_dim//2, out_dim),
+                nn.Dropout(dropout),
+                nn.LayerNorm(out_dim)
             )
         elif method == 'film':
             self.linear_l = FilmFusion(node_dim, cond_dim, out_dim, dropout=dropout)
         else:
             raise NotImplementedError()
-        self.drop_l = nn.Dropout(dropout)
+        # self.drop_l = nn.Dropout(dropout)
         self.method = method
         self.node_dim = node_dim
 
     def forward(self, graph):
-        node_feats = graph.node.node_feats('cat', self.drop_l)
+        node_feats = graph.node.node_feats('cat')
         if self.method == 'linear':
             node_feats = self.linear_l(node_feats)  # b, k, hid_dim
         elif self.method == 'film':
@@ -79,19 +84,19 @@ class GraphConvLayer(nn.Module):
         self.act_l = nn.ReLU()
 
     def forward(self, graph):
-        graph = self.e_feat_l(graph)
-        graph = self.e_weight_l(graph)
-        graph = self.e_param_l(graph)
-        graph = self.n_feat_l(graph)
+        e_feats = self.e_feat_l(graph)
+        e_weights = self.e_weight_l(graph, e_feats)
+        weights_op = graph.edge.load_op(e_weights.op_name)
+        e_feats = weights_op.attr_process(e_feats)
+        e_params = self.e_param_l(graph, e_feats)
+        n_feats = self.n_feat_l(graph)
 
-        # b_num, n_num, c_num = graph.batch_num, graph.node_num, graph.node.feat_num
-        e_weights = graph.edge_attrs['weights'].value * graph.edge_attrs['params'].value
-        last_op = graph.edge_attrs['weights'].op
-        n_j_feats = graph.node.feats[last_op.node_j_ids]
+        e_weights = e_weights.value * e_params.value
+        n_j_feats = n_feats[weights_op.node_j_ids]
         nb_feats = e_weights * n_j_feats
-        nb_feats = ts.scatter_add(nb_feats, last_op.node_i_ids, dim=0)
+        nb_feats = ts.scatter_add(nb_feats, weights_op.node_i_ids, dim=0)
         nb_feats = self.act_l(nb_feats)
-        graph.node.update_feats(nb_feats)
+        graph.node.feats = nb_feats
         return graph
 
 
@@ -107,10 +112,12 @@ class GraphClsLayer(nn.Module):
         self.method = method
         if method == 'linear':
             self.cls_l = nn.Sequential(
+                nn.Linear(v_dim, out_dim),
                 nn.Dropout(dropout),
-                nn.utils.weight_norm(nn.Linear(v_dim, out_dim // 2)),
-                nn.ReLU(inplace=True),
-                nn.utils.weight_norm(nn.Linear(out_dim // 2, out_dim))
+                nn.LayerNorm(out_dim),
+                nn.Linear(out_dim, out_dim//2 * 2),
+                nn.GLU(),
+                nn.Linear(out_dim//2, out_dim),
             )
         else:
             raise NotImplementedError()
