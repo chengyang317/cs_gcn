@@ -3,6 +3,7 @@ import pt_pack as pt
 import torch
 from .graph.edge import EdgeAttr, EdgeTopK
 from .graph import Graph
+import pt_pack as pt
 
 
 __all__ = ['FilmFusion', 'EdgeFeat', 'EdgeWeight', 'EdgeParam', 'NodeFeat']
@@ -15,26 +16,24 @@ class FilmFusion(nn.Module):
                  out_dim: int,
                  norm_type='layer',
                  dropout: float = 0.,
-                 act_type: str = 'relu'
+                 act_type: str = 'relu',
+                 params=None,
                  ):
         super().__init__()
-        # self.cond_proj_l = nn.utils.weight_norm(nn.Linear(cond_dim, out_dim*2))
-        self.cond_proj_l = nn.Sequential(
-            nn.Linear(cond_dim, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.Linear(out_dim, out_dim*2)
-        )
-        self.drop_l = nn.Dropout(dropout)
-        self.film_l = pt.Linear(in_dim, out_dim, norm_type=norm_type, norm_affine=False, orders=('linear', 'norm', 'cond'))
-        self.act_l = pt.Act(act_type)
+        self.cond_proj = pt.PtLinear(cond_dim, out_dim*2, orders=params.f_c_orders, norm=params.f_c_norm,
+                                     drop=params.f_c_drop)
+        self.x_linear = pt.PtLinear(in_dim, out_dim, orders=params.f_x_orders, drop=dropout, norm=params.f_x_norm,
+                                    norm_affine=False, bias=False)
+        self.cond_l = pt.Cond()
+        self.act_l = pt.Act(params.f_act)
 
     def forward(self, x, cond, batch_ids=None):
-        gamma, beta = self.cond_proj_l(cond).chunk(2, dim=-1)
+        gamma, beta = self.cond_proj(cond).chunk(2, dim=-1)
         gamma += 1.
         if batch_ids is not None:
             beta, gamma = beta[batch_ids], gamma[batch_ids]
-        x = self.drop_l(x)
-        x = self.film_l(x, gamma, beta)
+        x = self.x_linear(x)
+        x = self.cond_l(x, gamma, beta)
         x = self.act_l(x)
         return x
 
@@ -45,28 +44,34 @@ class EdgeFeat(nn.Module):
                  cond_dim,
                  edge_dim,
                  method: str,
-                 dropout=0.,
+                 params=None,
                  ):
         super().__init__()
         self.method = method
         self.node_dim = node_dim
         self.cond_dim = cond_dim
         self.edge_dim = edge_dim
+        self.params = params
+        self.use_n_geo = params.e_f_use_nGeo
         if self.method in ('share', 'none'):
             return
         self.n2n, self.n2c = method.split('_')
-        self.n_proj = nn.Sequential(
-            nn.Linear(node_dim+64, edge_dim),
-            nn.Dropout(dropout),
-            nn.LayerNorm(edge_dim)
-        )
-        self.e_geo_linear = nn.Sequential(
-            nn.Linear(64, 128),
-            nn.LayerNorm(128)
-        )
-        self.drop_l = nn.Dropout(dropout)
-        join_dim = edge_dim + 128 if self.n2n in ('sum', 'mul', 'max') else edge_dim * 2 + 128
-        self.n2c_fusion = FilmFusion(join_dim, cond_dim, edge_dim)
+
+        if params.n_geo_method in ('sum', 'none') or not self.use_n_geo:
+            n_dim = node_dim
+        else:
+            n_dim = node_dim + params.n_geo_out_dim
+
+        orders = params.e_f_orders if self.n2n == 'mul' else params.e_f_orders
+        self.n_proj = pt.PtLinear(n_dim, edge_dim, drop=params.e_f_drop, norm=params.e_f_norm, orders=orders)
+
+        if params.e_geo_method == 'linear':
+            orders = params.e_geo_orders if self.n2n == 'mul' else params.e_geo_orders
+            self.e_geo_linear = pt.PtLinear(params.e_geo_dim, params.e_geo_out_dim, orders=orders, norm=params.e_geo_norm)
+        else:
+            self.e_geo_linear = None
+        join_dim = edge_dim + params.e_geo_out_dim if self.n2n in ('sum', 'mul', 'max') else edge_dim * 2 + params.e_geo_out_dim
+        self.n2c_fusion = FilmFusion(join_dim, cond_dim, edge_dim, params=params)
 
     @property
     def layer_key(self):
@@ -82,12 +87,10 @@ class EdgeFeat(nn.Module):
         if self.layer_key not in graph.edge.feat_layers:
             graph.edge.feat_layers[self.layer_key] = self
 
-        node_feats = self.n_proj(node.node_feats('cat'))
+        node_feats = node.node_feats() if self.use_n_geo else node.feats
+        node_feats = self.n_proj(node_feats)
         n_join_feats = graph.edge.combine_node_attr(node_feats, self.n2n)
-
-        if graph.edge.geo_layer is None:
-            graph.edge.geo_layer = self.e_geo_linear
-        e_geo_feats = graph.edge.geo_layer(graph.edge.geo_feats(node).repeat(1, 8))
+        e_geo_feats = edge.geo_feats(node, self.e_geo_linear)
         join_feats = torch.cat((n_join_feats, e_geo_feats), dim=-1)
 
         if self.n2c == 'film':
@@ -102,21 +105,18 @@ class EdgeWeight(nn.Module):
     def __init__(self,
                  edge_dim: int,
                  method: str,
-                 dropout: float = 0.
+                 params=None,
                  ):
         super().__init__()
         self.edge_dim = edge_dim
+        self.params = params
         self.score_method, self.norm_method, self.reduce_size = pt.str_split(method, '_')
         if self.score_method == 'share':
             self.score_l = None
         elif self.score_method == 'linear':
             self.score_l = nn.Sequential(
-                nn.Linear(edge_dim, edge_dim),
-                nn.Dropout(dropout),
-                nn.LayerNorm(edge_dim),
-                nn.Linear(edge_dim, edge_dim//2),
-                nn.GLU(),
-                nn.Linear(edge_dim//4, 1),
+                pt.PtLinear(edge_dim, edge_dim//2, norm=params.e_w_norm, drop=params.e_w_drop, orders=params.e_w_orders),
+                pt.PtLinear(edge_dim//2, 1, norm='weight', orders='ln')  # for the ln orders, layer norm is terrible
             )
         else:
             raise NotImplementedError()
@@ -145,23 +145,19 @@ class EdgeParam(nn.Module):
                  edge_dim: int,
                  out_dim: int,
                  method: str,
-                 dropout: float = 0.
+                 params=None,
                  ):
         super().__init__()
         self.edge_dim = edge_dim
         self.out_dim = out_dim
         self.method = method
+        self.params = params
         if method in ('share', 'none'):
             return
         else:
-            self.e_param_l = nn.Sequential(
-                nn.Linear(edge_dim, edge_dim),
-                nn.Dropout(dropout),
-                nn.LayerNorm(edge_dim),
-                nn.Linear(edge_dim, edge_dim),
-                nn.GLU(),
-                nn.Linear(edge_dim//2, out_dim),
-                nn.Tanh(),
+            self.params_l = nn.Sequential(
+                pt.PtLinear(edge_dim, out_dim//2, norm=params.e_p_norm, drop=params.e_p_drop, orders=params.e_p_orders, act=params.e_p_act),
+                pt.PtLinear(out_dim//2, out_dim, norm=params.e_p_norm, orders='lna', act='tanh')
             )
 
     @property
@@ -177,7 +173,7 @@ class EdgeParam(nn.Module):
         if self.layer_key not in graph.edge.param_layers:
             graph.edge.param_layers[self.layer_key] = self
 
-        e_params = EdgeAttr('params', self.e_param_l(e_feats.value), e_feats.op_name)
+        e_params = EdgeAttr('params', self.params_l(e_feats.value), e_feats.op_name)
         return e_params
 
 
@@ -187,17 +183,22 @@ class NodeFeat(nn.Module):
                  cond_dim: int,
                  out_dim: int,
                  method: str,
-                 dropout: float = 0.,
+                 params=None,
                  ):
         super().__init__()
         self.method = method
         self.node_dim = node_dim
         self.cond_dim = cond_dim
         self.out_dim = out_dim
+        self.params = params
+        if params.n_geo_method in ('sum', 'none'):
+            n_dim = node_dim
+        else:
+            n_dim = node_dim + params.n_geo_out_dim
         if method in ('none', 'share'):
             return
         elif self.method == 'film':
-            self.feat_l = FilmFusion(node_dim+64, cond_dim, out_dim)
+            self.feat_l = FilmFusion(n_dim, cond_dim, out_dim, params=params, dropout=params.n_f_drop)
         elif self.method == 'linear':
             self.feat_l = nn.Sequential(
                 nn.utils.weight_norm(nn.Linear(node_dim, out_dim//2)),
@@ -227,8 +228,6 @@ class NodeFeat(nn.Module):
             )
         else:
             raise NotImplementedError()
-        self.drop_l = nn.Dropout(dropout)
-
 
     @property
     def layer_key(self):
@@ -242,7 +241,7 @@ class NodeFeat(nn.Module):
         if self.layer_key not in graph.node.feat_layers:
             graph.node.feat_layers[self.layer_key] = self
 
-        node_feats = graph.node.node_feats('cat', self.drop_l)
+        node_feats = graph.node.node_feats()
 
         if self.method == 'film':
             node_feats = self.feat_l(node_feats, graph.cond_feats, node.batch_ids)

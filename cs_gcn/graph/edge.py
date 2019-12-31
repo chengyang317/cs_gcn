@@ -2,7 +2,7 @@ import torch
 import collections
 from typing import Dict
 from pt_pack import node_intersect
-import torch_scatter as ts
+# import torch_scatter as ts
 
 
 __all__ = ['Edge', 'EdgeAttr', 'EdgeNull', 'EdgeTopK']
@@ -57,9 +57,14 @@ class EdgeOp(object):
         edge_attr = edge_attr.view(-1, edge_attr.size(-1))
         edge_attr = edge_attr - edge_attr.max()
         if norm_method == 'softmax':
-            exp = edge_attr.exp()
-            sums = ts.scatter_add(exp, self.node_i_ids, dim=0) + 1e-9
-            norm_attr = exp / sums[self.node_i_ids]
+            # exp = edge_attr.exp()
+            # sums = ts.scatter_add(exp, self.node_i_ids, dim=0) + 1e-9
+            # norm_attr = exp / sums[self.node_i_ids]
+            edge_attr = edge_attr.exp()
+            fake_attr = self.reshape(edge_attr)
+            sums = fake_attr.sum(dim=2, keepdims=True) + 1e-9
+            norm_attr = fake_attr / sums
+            norm_attr = norm_attr[self.masks]
         elif norm_method == 'tanh':
             norm_attr = edge_attr.tanh()
         elif norm_method == 'sigmoid':
@@ -143,7 +148,7 @@ class EdgeOp(object):
         else:
             return cond_attr.view(self.batch_num, 1, 1, cond_attr.size(-1)).repeat(1, self.node_num, self.node_num, 1).view(-1, cond_attr.size(-1))
 
-    def origin_reshape(self, edge_attr, fill_value=0.):
+    def reshape(self, edge_attr, fill_value=0.):
         if edge_attr.dim() == 1:
             edge_attr = edge_attr.view(-1, 1)
         c_dim = edge_attr.size(-1)
@@ -229,10 +234,10 @@ class EdgeTopK(EdgeOp):
         self.op_process(by_attr, last_op)
 
     def op_process(self, by_attr, last_op):
-        fake_by_attr = last_op.origin_reshape(by_attr, fill_value=-1e3)
+        fake_by_attr = last_op.reshape(by_attr, fill_value=-1e3)
         self.top_ids = self.attr_topk(fake_by_attr, -2, self.reduce_size, keep_self=self.keep_self)
 
-        l_select_ids = last_op.origin_reshape(torch.arange(last_op.edge_num).cuda(self.device), fill_value=-1)
+        l_select_ids = last_op.reshape(torch.arange(last_op.edge_num).cuda(self.device), fill_value=-1)
         l_select_ids = l_select_ids.gather(index=self.top_ids, dim=-2).view(-1)
         self.l_select_ids = l_select_ids[l_select_ids != -1]
         self.node_i_ids, self.node_j_ids = self._attr_process(last_op.node_i_ids), self._attr_process(
@@ -276,22 +281,46 @@ class Edge(EdgeInit):
     def __init__(self,
                  node,
                  init_method: str,
+                 params=None
                  ):
         super().__init__(init_method, node)
         self.geo_layer = None
         self.feat_layers, self.score_layers, self.param_layers = {}, {}, {}
+        self._geo_feats = None
+        self.params = params
+        self.geo_reuse, self.geo_dim = params.e_geo_reuse, params.e_geo_dim
 
-    def geo_feats(self, node):
-        node_size, _ = node.size_center()
+    def geo_feats(self, node, geo_layer=None):
+        if self.geo_reuse and self._geo_feats is not None:
+            return self._geo_feats
+        node_size, node_center = node.size_center()
         node_i_box, node_j_box = self.expand_node_attr(node.boxes)
         node_i_size, node_j_size = self.expand_node_attr(node_size)
 
         node_dist = node_i_box - node_j_box
         node_dist = node_dist / (node_i_size.repeat(1, 2) + 1e-9)
         node_scale = node_i_size / (node_j_size + 1e-9)
-        node_mul = (node_i_size[:, 0] * node_j_size[:, 1]) / (node_j_size[:, 0] * node_j_size[:, 1] + 1e-9)
-        node_sum = (node_i_size[:, 0] + node_j_size[:, 1]) / (node_j_size[:, 0] + node_j_size[:, 1] + 1e-9)
-        return torch.cat((node_dist, node_scale, node_mul[:, None], node_sum[:, None]), dim=-1)
+        node_mul = (node_i_size[:, 0] * node_i_size[:, 1]) / (node_j_size[:, 0] * node_j_size[:, 1] + 1e-9)
+        node_sum = (node_i_size[:, 0] + node_i_size[:, 1]) / (node_j_size[:, 0] + node_j_size[:, 1] + 1e-9)
+        geo_feats = torch.cat((node_dist, node_scale, node_mul[:, None], node_sum[:, None]), dim=-1)  # n,8
+
+        if getattr(self.params, 'e_geo_aug', None) is True:
+            node_i_center, node_j_center = self.expand_node_attr(node_center)
+            center_dist = node_i_center - node_j_center  # w,h
+            center_dist_v = center_dist.pow(2).sum(dim=-1, keepdims=True)
+            center_theta = torch.atan2(center_dist[:, 1], center_dist[:, 0])[:, None]
+            geo_feats = torch.cat((geo_feats, center_dist, center_dist_v, center_theta), dim=-1)  # n, 12
+
+        if self.geo_dim is not None:
+            geo_feats = geo_feats.repeat(1, self.geo_dim//geo_feats.size(-1))
+        if geo_layer is not None and self.geo_layer is None:
+            self.geo_layer = geo_layer
+        if self.geo_layer is not None:
+            geo_feats = self.geo_layer(geo_feats)
+        if self.geo_reuse:
+            self._geo_feats = geo_feats
+        return geo_feats
+
 
 
 

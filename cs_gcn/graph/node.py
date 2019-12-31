@@ -9,10 +9,14 @@ __all__ = ['Node']
 class Node(object):
     caches = {}
 
-    def __init__(self, node_feats, node_boxes=None, node_masks=None, node_nums=None):
+    def __init__(self, node_feats, node_boxes=None, node_masks=None, node_nums=None, params=None):
         self.feat_layers = collections.defaultdict(None)
         self.logit_layers = {}
         self.logits = None
+        self.geo_layer = None
+        self.params = params
+        self.geo_reuse, self.geo_dim, self.geo_method = params.n_geo_reuse, params.n_geo_dim, params.n_geo_method
+        self.geo_out_dim = params.n_geo_out_dim
         if node_nums is not None:
             self.batch_num, self.node_num = node_nums.shape[0], node_nums.max().item()
             node_masks = self.node_num_cache.cuda(node_nums.device) < node_nums[:, None]
@@ -58,6 +62,8 @@ class Node(object):
             # self.select_ids = None
             self.batch_ids = self.batch_ids_cache.cuda(self.device).view(-1)
         self._box_size, self._box_center = None, None
+        self._geo_feats = None
+        self.feats_dim = self.geo_dim + self.feat_num
 
     @property
     def node_num_cache(self):
@@ -107,16 +113,6 @@ class Node(object):
         else:
             return self.idx_map[origin_node_i]
 
-    def node_feats(self, method='clean', drop_l=None):
-        node_feats = drop_l(self.feats) if drop_l is not None else self.feats
-        if method == 'cat':
-            box_feats = torch.cat([*self.size_center(), self.boxes], dim=-1).repeat(1, 8)
-            return torch.cat([node_feats, box_feats], dim=-1)
-        elif method == 'clean':
-            return self.feats
-        else:
-            raise NotImplementedError()
-
     @property
     def device(self):
         return self.feats.device
@@ -136,6 +132,38 @@ class Node(object):
             self._box_center = boxes[:, :2] + 0.5 * self._box_size  # b, k, 2
         return self._box_size, self._box_center
 
+    def geo_feats(self, geo_layer=None):
+        if self.geo_reuse and self._geo_feats is not None:
+            return self._geo_feats
+        # geo_feats = torch.cat([*self.size_center()], dim=-1)
+        geo_feats = torch.cat([self.boxes, *self.size_center()], dim=-1)
+        if self.geo_dim is not None:
+            geo_feats = geo_feats.repeat(1, self.geo_dim//geo_feats.size(-1))
+        if geo_layer is not None and self.geo_layer is None:
+            self.geo_layer = geo_layer
+        if self.geo_layer is not None:
+            geo_feats = self.geo_layer(geo_feats)
+        if self.geo_reuse:
+            self._geo_feats = geo_feats
+        return geo_feats
+
+    def node_feats(self, geo_layer=None, drop_l=None):
+        node_feats = self.feats
+        if drop_l is not None:
+            node_feats = drop_l(node_feats)
+        if 'none' in self.geo_method:
+            return node_feats
+        geo_feats = self.geo_feats(geo_layer)
+        if 'cat' in self.geo_method:
+            node_feats = torch.cat([node_feats, geo_feats], dim=-1)
+        elif 'sum' in self.geo_method:
+            node_feats = node_feats + geo_feats
+        elif 'none' in self.geo_method:
+            node_feats = node_feats
+        else:
+            raise NotImplementedError()
+        return node_feats
+
     def expand_cond_attr(self, cond_attr):
         """
 
@@ -146,6 +174,11 @@ class Node(object):
             return cond_attr.unsqueeze(1).repeat(1, self.node_num, 1).view(-1, cond_attr.size(-1))
         return cond_attr[self.batch_ids]
 
+    def reshape(self, node_attr, fill_value=0.):
+        fake_attr = node_attr.new_full((self.batch_num, self.node_num, node_attr.size(-1)), fill_value)
+        # new_attr = new_attr.masked_fill(self.mask.unsqueeze(-1), edge_attr)
+        fake_attr[self.masks] = node_attr
+        return fake_attr
 
 
 
